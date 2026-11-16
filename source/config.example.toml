@@ -1,0 +1,9 @@
+# Optional. Rename to config.toml and place beside xer or xer.exe.
+# No passwords, tokens or private keys should be stored in this file.
+[network]
+port = 8443
+# proxy = "socks5h://127.0.0.1:9050"
+
+[transfer]
+chunk = "1M"
+parallel = 1

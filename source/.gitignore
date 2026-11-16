@@ -1,0 +1,14 @@
+/dist/
+/release/
+*.exe
+*.test
+config.toml
+*.pem
+*.key
+*.sig
+*.log
+*.tmp
+*.xer-part
+.xer-data/
+.DS_Store
+Thumbs.db

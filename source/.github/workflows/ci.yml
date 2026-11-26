@@ -5,18 +5,42 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  native-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          go-version-file: go.mod
-      - run: go test ./...
-      - run: go test -race ./...
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - run: go build ./...
+      - run: go test -count=1 -timeout=5m ./...
+      - run: go test -race -count=1 -timeout=5m ./...
       - run: go vet ./...
-      - name: Cross-compile
+      - run: go test -cover -timeout=5m ./...
+  cross-build-and-vulns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.4'
+          cache: false
+      - name: Cross-compile release targets
         run: |
           for target in linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64; do
             GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -trimpath -o /tmp/xer-build .
           done
+      - name: Install vulnerability scanner
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+      - run: govulncheck ./...

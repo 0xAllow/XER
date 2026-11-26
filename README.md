@@ -1,140 +1,171 @@
 # XER
 
-**Choose the transport. Trust the connection. Transfer securely.**
+Native Go CLI for explicit HTTPS/TLS 1.3 and OpenSSH SFTP file transfers.
 
-**Author:** 0xAllow  
-**Version:** `v0.0` (public preview / experimental)  
-**License:** MIT
+**Author:** 0xAllow. **Version:** `0.0.1-dev`. **License:** MIT.
 
-XER is a compact, native command-line tool for encrypted file transfer on Windows, Linux and macOS. It implements a direct HTTPS/TLS 1.3 receiver with verified one-time device pairing, file chunking, concurrent uploads, upload/download resume, and strict no-overwrite completion. It also uses the system's OpenSSH `sftp` program to work with existing SSH servers.
+**Security / release status:** integrated development source, **PARTIALLY VERIFIED**, not independently audited or certified. The delivery environment did not have a Go SDK; the Go build, tests, race detector and cross-builds in this version have not been run there. The included CI is configured to run them after upload, but no CI result is implied. Do not rely on this prerelease for irreplaceable data or expose its receiver to untrusted networks. See [RELEASE-REPORT.md](RELEASE-REPORT.md) and [TEST-REPORT.md](TEST-REPORT.md).
 
-**Security status:** Development build, **not independently audited**. Builds, unit tests and local integration tests do not demonstrate full interoperability with arbitrary installations, proxies or OS configurations. Avoid relying on this prerelease for irreplaceable data.
+## Build
 
-## What makes XER distinct
-
-XER focuses on a specific operational workflow rather than a broad transfer ecosystem:
-
-- **Explicit transport control:** every transfer requires `--via https` or `--via sftp`; failure never silently switches transports.
-- **Verified first-use trust for native HTTPS:** users compare a short code on both devices; future sessions use persisted device trust without asking users to paste TLS fingerprints.
-- **One executable for native HTTPS:** receiver and sender are built into a compact Go binary, without Python, curl or a hosted account.
-- **Resumable HTTPS uploads with bounded parallel workers:** independent chunks are integrity-checked; already confirmed chunks can be skipped on retry.
-- **Failure-conscious network paths:** explicit proxies do not fall back to direct networking; the app exposes IPv4/IPv6 selection.
-- **Automation without a hosted controller:** local YAML jobs integrate with operating-system schedulers.
-
-These are XER's *design choices*, not claims of exclusive invention or superiority. HTTPS and SFTP have different guarantees: see the limitations below.
-
-## Quick start
-
-Put the correct native binary on both computers. On Windows, rename `xer-windows-amd64.exe` to `xer.exe`. On Linux/macOS, rename the matching binary to `xer` and run `chmod +x xer`. No Python, curl, JVM or other runtime is needed for built-in HTTPS transfers. Windows Defender Firewall may require a narrowly scoped inbound TCP 8443 rule on the receiver.
-
-**Receiver** (in the directory where files should arrive):
-
-```powershell
-.\xer.exe serve
-```
-
-The default listener is TCP port 8443 on local interfaces. You can limit the interface and change the receiving directory:
-
-```powershell
-.\xer.exe serve --dir C:\Received --listen 192.168.1.102:8443
-```
-
-**Sender**, on another computer:
-
-```powershell
-.\xer.exe send "C:\path\to\file.txt" 192.168.1.102 --via https
-```
-
-On **first connection**, XER displays a certificate-derived pairing verification code on each computer. **Compare both codes over a trusted channel and type `YES` on both computers only if they match.** This first check cannot safely be skipped. XER retains the verified receiver identity and authorized client certificate for subsequent transfers; no `token.txt` or pasted TLS fingerprint is required.
-
-Retrieve a file:
-
-```powershell
-.\xer.exe get 192.168.1.102:test.txt --via https
-```
-
-Do not stop the receiver while a transfer is running. Files already present at the destination are not overwritten by HTTPS `send` or `get`.
-
-## Command reference
-
-```text
-xer serve [--dir PATH] [--listen ADDRESS:PORT]
-xer send FILE HOST[:PORT] --via https [--chunk 4M] [--parallel 4]
-xer get HOST[:PORT]:FILE [OUTPUT] --via https
-xer send FILE USER@HOST --via sftp [--port 2222]
-xer get USER@HOST:FILE [OUTPUT] --via sftp [--port 2222]
-xer dns EXAMPLE.COM
-xer auto add JOB.yaml | run NAME | list | remove NAME | install | uninstall | tick
-xer trust list | remove CLIENT_FINGERPRINT
-xer --help
-xer --version
-```
-
-Manual transfer protocol selection is required. XER **never changes `--via`** to another transport when the selected one fails.
-
-### HTTPS chunking, resume and parallelism
-
-HTTPS uploads use bounded-size chunks, authenticated TLS 1.3 records, per-chunk integrity checks and a final local integrity check before publication. The default chunk size is 1 MiB and the default number of upload workers is one. Larger chunks are streamed and spooled to disk on the receiver; available disk space and disk I/O matter. `--chunk` permits up to 64 MiB, `--parallel` 1–8 workers:
+The module, workflow, license and source are at this repository root. Use Go **1.27.4 or a newer supported security release**. The application has no external Go dependencies; `go.sum` is intentionally empty. The higher minimum enables current traversal-resistant `os.Root` APIs.
 
 ```sh
-xer send backup.zip 192.168.1.102 --via https --chunk 4M --parallel 4
+go build -o xer .
+go build ./...
+go test -count=1 -timeout=5m ./...
+go test -race -count=1 -timeout=5m ./...
+go vet ./...
+go test -cover -timeout=5m ./...
 ```
 
-The sender keeps an upload resume record under the user's XER state directory. Already acknowledged chunks can be skipped on retry. An interrupted HTTPS download uses an unpublished `.xer-part` file and HTTP Range requests. The receiver does not publish partially uploaded files. Internal SHA-256 checks are automatic; users do not need to calculate or paste hashes. **Parallel download is not implemented**; download resume is sequential. Parallel uploads do not necessarily improve speed on every link or disk.
-
-### SFTP / SSH
+On Windows use `go build -o xer.exe .`. Use `gofmt -w .` with the real SDK before maintaining the code. Formatting could not be executed in the delivery environment either. To record all checks, including unavailable tools:
 
 ```sh
-xer send backup.zip admin@server.example --via sftp
-xer get admin@server.example:backup.zip --via sftp
-xer send backup.zip admin@server.example --via sftp --port 2222
+python3 scripts/verify.py --output verification-results.json
 ```
 
-SFTP uses the existing `sftp` executable and SSH configuration. `BatchMode=yes` and `StrictHostKeyChecking=yes` are required. Configure and verify the SSH host key through normal OpenSSH administration before running noninteractive transfers. XER does not automatically accept new SSH host keys. The SFTP backend relies on OpenSSH and **does not provide the same chunk-level resume, concurrency or atomic no-overwrite guarantees as the built-in HTTPS backend**. In particular, an SFTP upload can replace a remote file depending on server behavior: verify destination and permissions first. SFTP `--proxy` uses the same XER executable as an internal OpenSSH `ProxyCommand` helper, connecting through an explicitly selected HTTP CONNECT, HTTPS or SOCKS5(h) proxy. The proxy must permit SSH traffic on the destination port; no fallback to direct connection is allowed. For existing SSH jump hosts, native OpenSSH `ProxyJump` remains available through `ssh_config`. This adapter has not yet been validated against real Windows OpenSSH installations or Tor.
-
-### IPv4, IPv6 and proxies
-
-The direct HTTPS network stack supports dual-stack TCP (Go's Happy Eyeballs fallback), plus `--ipv4` and `--ipv6` for explicit address-family selection. Address selection follows the OS resolver; IPv6 is used preferentially where the resolver and network permit, and IPv4 can be used as fallback. The receiver can bind to an IPv6 literal via `--listen '[::1]:8443'`. For an IPv6 destination with a custom port use brackets: `[2001:db8::20]:8443`.
+Python is needed only for this optional verification script, not native HTTPS transfers. To scan known vulnerabilities separately, install the pinned scanner used by CI:
 
 ```sh
-xer send file.zip server.example --via https --ipv6
-xer send file.zip server.example --via https --proxy socks5h://127.0.0.1:9050
-xer send file.zip server.example --via https --proxy http://proxy.example:3128
-xer send file.zip server.example --via https --proxy https://proxy.example:443
+go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+govulncheck ./...
 ```
 
-Proxy types: HTTP CONNECT, HTTPS proxy, SOCKS5 and SOCKS5h. When selecting SOCKS5h, XER sends destination hostname resolution through the proxy (including with a locally running Tor SOCKS port); it does not install or start Tor. Credentials embedded in proxy URLs are forbidden. Explicitly configured proxies **fail closed**: XER will not retry directly if the proxy is unavailable. HTTPS and SSH certificate/host verification remain mandatory. SOCKS5 proxy authentication other than the no-authentication method is not implemented. IPv4/IPv6 flags on an explicit proxy apply to reaching the proxy itself, not to the remote target address chosen by that proxy.
+## First-use HTTPS pairing
 
-### Encrypted DNS diagnostics
+Use this version on both devices for first-use pairing. Protocol v2 uses a fresh client nonce and receiver session ID, expires after at most two minutes and requires **both** approvals. The receiver is closed to new pairing by default.
+
+1. Start a receiver in a trusted directory, opening a short pairing window:
+
+   ```sh
+   xer serve --dir /path/to/received --listen 127.0.0.1:8443 --pair-window 5m
+   ```
+
+   Replace the loopback listen address with the appropriate LAN interface when transferring between machines. `serve` without `--listen` binds all interfaces on port 8443. Use `--pair-window` only while expecting a device.
+
+2. Start the sender:
+
+   ```sh
+   xer send /path/to/file.bin receiver.example:8443 --via https
+   ```
+
+3. Both terminals display an 80-bit hexadecimal verification code for this exact certificate pair and session. Compare the **entire code over an independently trusted channel**. The receiver prints a command:
+
+   ```sh
+   xer trust approve SESSION_ID CODE
+   ```
+
+   Run that exact command from the receiver directory, using a second terminal. The sender operator types `YES` only after comparing the two displays. Either order of the two approvals is supported. Receiver approval alone does not authorize transfer; sender confirmation alone waits for receiver approval. Wrong codes, cancellation and expired sessions do not commit trust.
+
+A pairing attempt cannot block a receiver stdin prompt or create an unbounded approval queue. There is one pending session and at most ten new challenges per explicitly opened receiver window. An unexpected request can occupy that slot until cancellation/expiry; do not approve it. After pairing, restart normally without `--pair-window` if the current window has not elapsed.
 
 ```sh
-xer dns example.com
+xer serve --dir /path/to/received
+xer send file.bin receiver.example:8443 --via https --chunk 4M --parallel 4
+xer get receiver.example:8443:file.bin ./download.bin --via https
 ```
 
-Performs A/AAAA lookups through DNS-over-HTTPS to the configured HTTPS DNS service implemented in XER. This is **a diagnostic command**, not DNS-based file transfer. It is separate from the system's ordinary resolver, which may still be used for direct HTTPS and SFTP connections.
+Windows examples:
 
-## Optional config.toml
-
-Rename `config.example.toml` to `config.toml` **beside the executable**, not in the current working directory. XER runs without it. Recognized settings:
-
-```toml
-[network]
-port = 8443
-# proxy = "socks5h://127.0.0.1:9050"
-
-[transfer]
-chunk = "1M"
-parallel = 1
+```powershell
+.\xer.exe serve --dir C:\Received --pair-window 5m
+.\xer.exe send C:\Backups\backup.zip 192.168.1.102 --via https
+.\xer.exe get 192.168.1.102:backup.zip C:\Downloads\backup.zip --via https
 ```
 
-No private keys, passwords or API tokens belong here. For portability, device identities and trust databases are stored in the per-user OS configuration directory (`os.UserConfigDir()`), not in the portable TOML file. Keep the binary directory and state directory writable only by trusted accounts.
+## Trust and identity
 
-## YAML automation (and only automation)
+Receiver certificate pinning is mandatory after pairing. A trusted fingerprint is checked together with certificate validity on every new authorized request, including reused TLS connections. A certificate's public bytes alone are not enough to impersonate a client: TLS proves possession of its private key.
+
+```sh
+# Run from the receiver directory:
+xer trust list
+xer trust remove CLIENT_FINGERPRINT
+
+# Sender: remove a saved receiver profile before a deliberate re-pair:
+xer trust forget RECEIVER_ALIAS
+```
+
+Revocation applies to subsequent requests; it does not recall bytes already sent or cancel an already authorized streaming response. Trust updates and profile updates use kernel locks and atomic files. A second receiver process using the same state directory is refused.
+
+Certificates currently last one year. There is no silent certificate renewal that preserves a stale pin. For a deliberate rotation: stop the affected process, back up its private state securely, replace the affected identity key/certificate pair, then explicitly forget/re-pair the receiver and revoke old client fingerprints. If state was previously exposed through broad permissions, rotate identities. Do not delete keys casually or disable pinning to bypass expiry.
+
+## Filesystem safety, integrity and resume
+
+HTTPS upload chunks are independently SHA-256 checked, streamed to private temporary storage, then written under a lock for that upload. Completion checks all chunk positions, size and the full digest. Final publication uses a hardlink and refuses an existing destination. Unrelated uploads have separate locks.
+
+Uploads remember their receiver, pin, source path/content and **chunk size**. A retry with changed chunk size starts another compatible session. Expired abandoned sessions are reclaimed when a new upload is initialized. Startup under the receiver singleton lock removes orphan spools and recovers commits interrupted between hardlink publication and metadata cleanup. A retry after a lost completion response can recognize an already committed file by exact size and digest, only when a prior cached upload record exists.
+
+Downloads resume in a private `.xer-download-<id>/` directory beside the destination. Metadata binds it to the receiver pin, remote name, size and digest. A kernel lock prevents concurrent writers to the same staging session. Symlinks, hardlinks and non-regular staging files are rejected before any write. Receiver reads use `os.Root` and verified regular file handles, rejecting hardlinks and symlink escapes.
+
+Legacy `OUTPUT.xer-part` files are **never adopted or modified**. Remove them manually only after inspecting/backing up anything you need. A remote identity/content mismatch leaves the private staging state for inspection; remove the indicated staging directory to restart after closing active transfers. Completed staging directories retain only their reusable lock file.
+
+The destination directory and its ancestry must be controlled by your account or trusted OS administrators. Writable shared directories are conservatively refused; POSIX owner/mode checks and Windows owner/DACL checks enforce this policy. The application does not protect against malware running as your own account or administrators. Windows ACL and reparse-point handling is implemented but has not received native runtime validation in this delivery.
+
+Hardlink-capable filesystems are required for final publication (typically NTFS, ext4 or APFS). FAT/exFAT and some network filesystems may fail closed. No unsafe rename/overwrite fallback exists. Keep files immutable while serving/downloading them. Hash caching is bounded and checked against file identity, size and modification time; the client still verifies the full downloaded hash. Parallel download is not implemented. File and Unix directory sync are used where supported; Windows power-loss durability of directory entries is not guaranteed.
+
+### Receiver limits
+
+| Control | Default |
+| --- | --- |
+| File size | 64 GiB |
+| Published + reserved pending bytes | 128 GiB |
+| Pending uploads | 128 |
+| Published/root entries | 10,000 |
+| Chunks per upload | 65,536 |
+| Authenticated requests in flight | 8 |
+| TCP connections admitted | 64 |
+| Request-body deadline / per-write deadline | 2 minutes |
+| Abandoned upload metadata TTL | 24 hours |
+| Chunk size | 1 byte to 64 MiB; subject to chunk-count limit |
+| Sender parallel workers | 1 to 8 |
+
+Receiver flags: `--max-file-size BYTES`, `--max-storage BYTES`, `--max-pending N`, `--max-concurrent N`. Published files and pending reservations count toward storage quota; transient chunk spools add at most the configured request concurrency times 64 MiB. This is an application quota, not an OS disk reservation: other programs may consume free space. I/O failures are reported; use filesystem quotas if physical disk isolation is required. Full-file completion hashing has a separate bounded 30-minute connection; disconnected callers cancel hashing and leave the session resumable.
+
+## Explicit networking and SFTP
+
+Every manual transfer requires `--via https` or `--via sftp`. A failure never switches backends. Explicit proxies do not retry directly. `HTTP_PROXY`/`HTTPS_PROXY` environment variables are not implicitly used. Proxy URL credentials, query/fragment/path and missing ports are refused.
+
+```sh
+xer send file.bin host.example --via https --ipv4
+xer send file.bin '[::1]:8443' --via https --ipv6
+xer send file.bin host.example --via https --proxy http://proxy.example:3128
+xer send file.bin host.example --via https --proxy https://proxy.example:443
+xer send file.bin host.example --via https --proxy socks5h://127.0.0.1:9050
+xer send file.bin host.example --via https --no-proxy
+```
+
+For HTTPS proxies, outer TLS verifies the proxy hostname/PKI using system trust and does not offer the XER client identity. Inner TLS separately verifies the receiver pin and uses the paired XER client certificate. Outer proxy TLS permits TLS 1.2+ for both backends; native XER endpoint TLS is 1.3+. CONNECT status/header reads are bounded and proxy handshakes support cancellation/deadlines. SOCKS5 and SOCKS5h both forward destination hostnames to the proxy in this implementation; authentication other than no-auth is unsupported. IP-family flags select the proxy's address family when a proxy is used. Tor must already be running; XER does not install/start it.
+
+```sh
+xer send file.bin admin@server.example --via sftp --port 2222
+xer get admin@server.example:file.bin ./file.bin --via sftp
+```
+
+SFTP requires system OpenSSH `sftp`, preconfigured credentials and an independently verified known host key. BatchMode and StrictHostKeyChecking are mandatory. Shell command construction is not used for the transfer itself; ProxyCommand uses a quoted XER executable as a helper. Native SSH config/ProxyJump remains available.
+
+SFTP upload can overwrite the server's destination. It does not provide native HTTPS chunk resume or parallel workers. SFTP downloads use private staging and no-overwrite publication but do not resume; OpenSSH is asked to flush transfers with `-f`. SSH host-key/authentication behavior against real servers, Windows OpenSSH and Tor still need interoperability validation for this integrated version.
+
+`xer dns example.com` is a separate DNS-over-HTTPS diagnostic to `dns.google`. It is not a file-transfer protocol and does not replace the OS resolver for direct transfers.
+
+## Settings and automation
+
+Place optional `config.toml` beside the executable. See `config.example.toml` for the supported `[network]` and `[transfer]` scalars. Do not put secrets there.
+
+| State | Location |
+| --- | --- |
+| Sender identity and receiver profiles | `os.UserConfigDir()/xer` |
+| Upload resume records | `os.UserCacheDir()/xer/uploads` |
+| Receiver identity, device trust, pairing and upload metadata | receiver directory `/.xer-data` |
+| Download staging | `.xer-download-<id>` beside the chosen destination |
+
+Automation uses a restricted flat YAML subset, not a general YAML interpreter. Only the two implemented transports are accepted at import. Single-quoted values support literal special characters and doubled apostrophes; double-quoted values support the restricted JSON/Go escape syntax. General YAML tags, anchors, nesting and inline comments are unsupported. Relative source paths are converted to absolute paths relative to the job file; old stored relative jobs must be re-added. Pair HTTPS interactively first; scheduled jobs never approve first-use trust.
 
 ```yaml
-name: daily-transfer
-from: C:\Backups\backup.zip
-to: 192.168.1.102
+name: backup
+from: /absolute/path/backup.zip
+to: receiver.example:8443
 via: https
 every: daily
 at: "02:00"
@@ -143,53 +174,33 @@ at: "02:00"
 ```sh
 xer auto add automation.example.yaml
 xer auto list
-xer auto run daily-transfer
+xer auto run backup
 xer auto install
+xer auto tick
+xer auto uninstall
+xer auto remove backup
 ```
 
-`auto add` stores a job in a user-private directory; `auto run` executes once. `auto install` registers a once-per-minute runner with Windows Task Scheduler, Linux `systemd --user`, or macOS `launchd` in an interactive user session. `auto uninstall` removes the OS registration; `auto remove NAME` removes a stored job. `auto tick` is the scheduler entry point. Jobs support `every: manual`, `hourly`, or `daily` with `at: HH:MM` in local system time. **Pair interactively before scheduling HTTPS transfers**, because scheduled jobs cannot safely approve first-time trust. SSH keys must already work noninteractively. System services and permission/credential setup vary by operating system; test scheduling on the target machine before relying on it. Scheduler installation or running may fail if the operating system does not provide a user session or background scheduler.
+On Windows, start with `automation.windows.example.yaml` instead of the Unix example.
 
-The job syntax is intentionally a small **flat YAML subset**, not general-purpose YAML. No complex objects, tags, anchors or inline comments are supported. Manual transfers never require YAML.
+`auto install` uses systemd --user on Linux, launchd on macOS or Task Scheduler on Windows, running a once-per-minute tick. Scheduler installation has not been executed in this delivery. Use an interactive user session with keys/profiles available. Test on a disposable account before relying on it. Hourly jobs are due at minute 00; daily jobs at `HH:MM` in local system time. A tick outside the due minute does not catch up a missed job. DST slots include UTC offset; fallback can run the two distinct repeated local-time slots.
 
-## Security and limitations
+Automation uses SFTP port 22 and does not implement per-job port/network/chunk overrides. HTTPS never overwrites an existing destination: a recurring job with the same filename will fail after the first upload unless the operator rotates the receiver file or uses distinct input/job names.
 
-- No HTTP/FTP/plaintext fallback, no anonymous receiver by default, and no automatic acceptance of SSH host keys.
-- A new HTTPS device requires manual comparison of the same verification code displayed by both peers. Verify it over a trusted channel before approving.
-- Certificate identity and pairing authorization are stored locally; the receiver's `.xer-data` directory holds protected metadata and incomplete upload parts.
-- Always keep trusted-device records and private keys protected with OS permissions. On shared machines, separate OS user accounts.
-- The receiver uses TLS 1.3 and verified paired client identities. Uploads are published only after completeness and internal digest checks.
-- If sender files change during upload, the final digest must match the originally computed value or the commit will fail.
-- Native sender/receiver pairing requires reachable TCP connectivity; XER does not include a public relay or automatic NAT traversal.
-- Proxy and dual-stack interoperability have only been tested in the included local tests, not exhaustively against all networks and products.
-- **SFTP server upload overwrite prevention is not equivalent to the HTTPS backend.**
-- Code signing for Windows requires a real Authenticode certificate; macOS notarization requires an Apple Developer ID. The included signing workflows are not official signatures by themselves.
-- SHA-256 manifests provide integrity checks; Ed25519 signatures authenticate the manifest only when the trusted public key was obtained independently. Never include a release signing private key in source or release archives.
+Kernel job locks prevent overlap. Only successful slots are recorded; a failed due job can retry in that minute and does not prevent other due jobs from being checked. Transfers run sequentially within a tick; a long-running job can delay others. Scheduler environment and network availability still matter.
 
-## Build and validate
-
-Go 1.23+ is required to build from source. The core has **no external Go dependencies**.
+## Release packaging
 
 ```sh
-go test -count=2 -race ./...
-go vet ./...
-bash scripts/build-release.sh
+bash scripts/build-release.sh dist
 ```
 
-The build script produces Windows amd64, Linux amd64/arm64, macOS amd64/arm64 unsigned binaries and `SHA256SUMS`. It does not include icons. See `scripts/sign-windows.ps1`, `scripts/sign-macos.sh`, and the `cmd/xer-artifact` tool for authenticated artifact releases.
-
-To sign an artifact checksum manifest with an independently protected Ed25519 signing key:
+The output directory must be empty. The script builds/tests with a real SDK and emits unsigned Windows amd64, Linux amd64/arm64 and macOS amd64/arm64 binaries plus SHA256SUMS. No binaries are included in this source delivery because none were compiled here. Run native signing on authorized machines, regenerate the manifest **after** signing, then sign the manifest with an independently protected Ed25519 key. Key generation refuses existing paths; manifests reject common private-key material in the artifact directory.
 
 ```sh
-go run ./cmd/xer-artifact keygen --private /secure/xer-signing-key.pem --public trusted-public.pem
+go run ./cmd/xer-artifact keygen --private /secure/signing.pem --public /secure/public.pem
 go run ./cmd/xer-artifact manifest --dir dist --manifest dist/SHA256SUMS
-go run ./cmd/xer-artifact sign --private /secure/xer-signing-key.pem --manifest dist/SHA256SUMS --signature dist/SHA256SUMS.sig
-go run ./cmd/xer-artifact verify --public trusted-public.pem --dir dist --manifest dist/SHA256SUMS --signature dist/SHA256SUMS.sig
+go run ./cmd/xer-artifact sign --private /secure/signing.pem --manifest dist/SHA256SUMS --signature dist/SHA256SUMS.sig
+go run ./cmd/xer-artifact verify --public /secure/public.pem --dir dist --manifest dist/SHA256SUMS --signature dist/SHA256SUMS.sig
 ```
 
-The above commands are an example only. A public signing key must be authenticated out of band, and the signing key must not be included in the distributed project. Native signing is a separate step done on authorized signing machines.
-
-## Project scope
-
-In scope: HTTPS/TLS 1.3 direct transfer, SFTP, secure pairing, chunked uploads, bounded parallel upload workers, resume, DoH diagnostics, proxy/Tor support for HTTPS, IPv4/IPv6 support, TOML settings, YAML automation and OS scheduler integration. Out of scope: cloud, messaging APIs, SMB, WebDAV, QUIC, WebRTC, DNS tunneling, file synchronization, bundled Tor or AI inference. An AI agent can automate XER only within explicitly granted local permissions; an MCP server is not included.
-
-See `TEST-REPORT.md` for the precise status of validation and limitations. The project may not be called universally "bug-free" or certified secure based on these tests.

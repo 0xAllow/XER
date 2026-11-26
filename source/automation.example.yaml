@@ -1,7 +1,7 @@
-# YAML is used only for automated jobs, not manual transfer configuration.
-name: daily-transfer
-from: C:\Backups\backup.zip
-to: 192.168.1.102
+# Replace with a real absolute path, then pair interactively before scheduling.
+name: backup
+from: /absolute/path/backup.zip
+to: receiver.example:8443
 via: https
 every: daily
 at: "02:00"

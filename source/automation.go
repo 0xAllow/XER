@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+ "strconv"
 	"strings"
 	"time"
 )
@@ -40,12 +41,14 @@ func parseJob(data []byte) (Job, error) {
 		if _, ok := values[k]; ok {
 			return j, fmt.Errorf("duplicate YAML key %q", k)
 		}
-		if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
-			v = v[1 : len(v)-1]
+		quoted:=false
+		if len(v)>=2 && v[0]=='\'' && v[len(v)-1]=='\'' {
+			quoted=true;body:=v[1:len(v)-1];var decoded strings.Builder
+			for i:=0;i<len(body);i++{if body[i]=='\'' {if i+1>=len(body) || body[i+1]!='\''{return j,errors.New("invalid YAML single quote")};i++};decoded.WriteByte(body[i])};v=decoded.String()
+		} else if len(v)>=2 && v[0]=='"' && v[len(v)-1]=='"' {
+			quoted=true;decoded,e:=strconv.Unquote(v);if e!=nil{return j,e};v=decoded
 		}
-		if v == "" || strings.ContainsAny(v, "\r\n\x00") || strings.ContainsAny(v, "#{}[]&*!|><`") {
-			return j, fmt.Errorf("invalid scalar value for %s", k)
-		}
+		if v=="" || strings.ContainsAny(v,"\r\n\x00") || (!quoted && strings.ContainsAny(v,"#{}[]&*!|><`")){return j,fmt.Errorf("invalid scalar value for %s",k)}
 		values[k] = v
 	}
 	if err := sc.Err(); err != nil {
@@ -55,8 +58,8 @@ func parseJob(data []byte) (Job, error) {
 	if !endpointName.MatchString(j.Name) || j.From == "" || j.To == "" {
 		return j, errors.New("job requires valid name, from and to")
 	}
-	if j.Via == "" {
-		return j, errors.New("automation requires explicit via: protocol")
+	if j.Via != "https" && j.Via != "sftp" {
+		return j, errors.New("automation requires explicit via: https or sftp")
 	}
 	if j.Every == "" {
 		j.Every = "manual"
@@ -82,7 +85,7 @@ func loadJob(name string) (Job, error) {
 	if e != nil {
 		return Job{}, e
 	}
-	b, e := os.ReadFile(filepath.Join(dir, name+".yaml"))
+	b, e := readPrivate(filepath.Join(dir, name+".yaml"),65536)
 	if e != nil {
 		return Job{}, e
 	}
@@ -94,8 +97,9 @@ func runJob(j Job) error {
 		if e != nil {
 			return e
 		}
-		j.From = filepath.Join(h, strings.TrimPrefix(j.From, "~/"))
+		if j.From=="~" {j.From=h} else {j.From = filepath.Join(h, strings.TrimPrefix(j.From, "~/"))}
 	}
+	if !filepath.IsAbs(j.From) {return errors.New("automation source must be absolute; re-add this job")}
 	switch j.Via {
 	case "https":
 		// Automated transfers must have a pre-paired identity; never prompt in a scheduled job.
@@ -126,7 +130,7 @@ func automation(args []string) error {
 		if len(args) != 2 {
 			return errors.New("usage: xer auto add FILE.yaml")
 		}
-		b, e := os.ReadFile(args[1])
+		b, e := readBoundedRegular(args[1],65536)
 		if e != nil {
 			return e
 		}
@@ -134,9 +138,13 @@ func automation(args []string) error {
 		if e != nil {
 			return e
 		}
-		if e = os.MkdirAll(dir, 0700); e != nil {
-			return e
-		}
+		if j.From=="~" || strings.HasPrefix(j.From,"~/") {h,err:=os.UserHomeDir();if err!=nil{return err};if j.From=="~"{j.From=h}else{j.From=filepath.Join(h,strings.TrimPrefix(j.From,"~/"))}}
+		if !filepath.IsAbs(j.From) {j.From,e=filepath.Abs(filepath.Join(filepath.Dir(args[1]),j.From));if e!=nil{return e}}
+		if j.Via=="https" {if _,e=address(j.To);e!=nil{return e}} else {if _,e=directSFTP(j.To,22);e!=nil{return e}}
+		quote:=func(value string)string{return "'"+strings.ReplaceAll(value,"'","''")+"'"}
+		b=[]byte(fmt.Sprintf("name: %s\nfrom: %s\nto: %s\nvia: %s\nevery: %s\n",quote(j.Name),quote(j.From),quote(j.To),quote(j.Via),quote(j.Every)));if j.At!=""{b=append(b,[]byte("at: "+quote(j.At)+"\n")...)}
+		if _,e=parseJob(b);e!=nil{return e}
+		if e=privateDir(dir);e!=nil{return e}
 		dest := filepath.Join(dir, j.Name+".yaml")
 		f, e := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if e != nil {
@@ -189,57 +197,32 @@ func automation(args []string) error {
 		}
 		return runJob(j)
 	case "tick":
-		// Call from the OS scheduler every minute. Timestamp is local time; job lock state
-		// prevents duplicate execution of same slot after restarts.
-		if len(args) != 1 {
-			return errors.New("usage: xer auto tick")
-		}
-		items, e := os.ReadDir(dir)
-		if errors.Is(e, os.ErrNotExist) {
-			return nil
-		}
-		if e != nil {
-			return e
-		}
-		now := time.Now()
-		// Expire old idempotency locks to avoid unbounded metadata growth.
-		for _, entry := range items {
-			if strings.HasSuffix(entry.Name(), ".lock") {
-				info, err := entry.Info()
-				if err == nil && now.Sub(info.ModTime()) > 48*time.Hour {
-					_ = os.Remove(filepath.Join(dir, entry.Name()))
-				}
-			}
-		}
-		for _, entry := range items {
-			if !strings.HasSuffix(entry.Name(), ".yaml") {
-				continue
-			}
-			name := strings.TrimSuffix(entry.Name(), ".yaml")
-			j, e := loadJob(name)
-			if e != nil {
-				return e
-			}
-			due := j.Every == "hourly" && now.Minute() == 0 || j.Every == "daily" && now.Format("15:04") == j.At
-			if !due {
-				continue
-			}
-			key := now.Format("200601021504")
-			lock := filepath.Join(dir, name+"."+key+".lock")
-			f, e := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-			if errors.Is(e, os.ErrExist) {
-				continue
-			}
-			if e != nil {
-				return e
-			}
-			f.Close()
-			if e = runJob(j); e != nil {
-				return fmt.Errorf("job %s: %w", name, e)
-			}
-		}
-		return nil
+		if len(args)!=1{return errors.New("usage: xer auto tick")}
+		return runDueJobs(dir,time.Now())
 	default:
 		return errors.New("unknown auto command")
 	}
+}
+
+// Kernel run locks prevent overlap, while a success record prevents duplicate
+// successful execution in a slot. Failed attempts may retry; other jobs continue.
+func runDueJobs(dir string,now time.Time) error {
+ items,err:=os.ReadDir(dir);if errors.Is(err,os.ErrNotExist){return nil};if err!=nil{return err}
+ var failures []error
+ for _,entry:=range items{
+  if !strings.HasSuffix(entry.Name(),".yaml"){continue}
+  name:=strings.TrimSuffix(entry.Name(),".yaml");j,e:=loadJob(name)
+  if e!=nil{failures=append(failures,fmt.Errorf("job %s: %w",name,e));continue}
+  due:=j.Every=="hourly" && now.Minute()==0 || j.Every=="daily" && now.Format("15:04")==j.At
+  if !due{continue}
+  lock,e:=acquireLock(filepath.Join(dir,name+".run.lock"));if errors.Is(e,errStateBusy){continue};if e!=nil{failures=append(failures,e);continue}
+  slot:=now.Format("200601021504-0700");var previous string;state:=filepath.Join(dir,name+".last.json")
+  e=readPrivateJSON(state,&previous,65536)
+  if e!=nil && !errors.Is(e,os.ErrNotExist){failures=append(failures,e);lock.Close();continue}
+  if previous==slot{lock.Close();continue}
+  if e=runJob(j);e==nil{e=storeJSON(state,slot)}
+  if e!=nil{failures=append(failures,fmt.Errorf("job %s: %w",name,e))}
+  if e=lock.Close();e!=nil{failures=append(failures,e)}
+ }
+ return errors.Join(failures...)
 }

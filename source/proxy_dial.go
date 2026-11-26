@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+ "crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -52,8 +53,8 @@ func proxyDialCommand(args []string) error {
 	done := make(chan error, 1)
 	go func() {
 		_, e := io.Copy(conn, os.Stdin)
-		if tcp, ok := conn.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
+		if half, ok := conn.(interface{CloseWrite()error}); ok {
+			_ = half.CloseWrite()
 		}
 		done <- e
 	}()
@@ -64,58 +65,35 @@ func proxyDialCommand(args []string) error {
 	}
 	return nil
 }
-func dialHTTPProxy(p *url.URL, target string) (net.Conn, error) {
-	c, e := dialNetwork(context.Background(), "tcp", p.Host, activeNetwork.Family)
-	if e != nil {
-		return nil, e
-	}
-	good := false
-	defer func() {
-		if !good {
-			c.Close()
-		}
-	}()
-	if p.Scheme == "https" {
-		tc := tls.Client(c, &tls.Config{MinVersion: tls.VersionTLS12, ServerName: p.Hostname()})
-		if e = tc.Handshake(); e != nil {
-			return nil, e
-		}
-		c = tc
-	}
-	c.SetDeadline(time.Now().Add(20 * time.Second))
-	// Headers contain only validated hostnames and numeric ports.
-	if strings.ContainsAny(target, "\r\n") {
-		return nil, errors.New("invalid target")
-	}
-	if _, e = fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", target, target); e != nil {
-		return nil, e
-	}
-	rd := bufio.NewReader(c)
-	status, e := rd.ReadString('\n')
-	if e != nil {
-		return nil, e
-	}
-	if !strings.HasPrefix(status, "HTTP/1.1 200 ") && !strings.HasPrefix(status, "HTTP/1.0 200 ") {
-		return nil, fmt.Errorf("proxy CONNECT declined: %s", strings.TrimSpace(status))
-	}
-	total := len(status)
-	for {
-		line, err := rd.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		total += len(line)
-		if total > 16384 {
-			return nil, errors.New("proxy headers too large")
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
-	c.SetDeadline(time.Time{})
-	good = true
-	// bufio.Reader may have prefetched part of the SSH handshake.
-	return &bufferedConn{Conn: c, reader: rd}, nil
+func dialHTTPProxy(p *url.URL,target string)(net.Conn,error){return dialHTTPProxyContext(context.Background(),p,target,activeNetwork.Family,nil)}
+func dialHTTPProxyContext(ctx context.Context,p *url.URL,target,family string,roots *x509.CertPool)(net.Conn,error){
+ host,port,err:=net.SplitHostPort(target);if err!=nil || host=="" || strings.ContainsAny(host,"\r\n\x00 \t"){return nil,errors.New("invalid proxy target")}
+ n,err:=strconv.Atoi(port);if err!=nil || n<1 || n>65535{return nil,errors.New("invalid proxy target port")}
+ c,err:=dialNetwork(ctx,"tcp",p.Host,family);if err!=nil{return nil,err}
+ good:=false
+ defer func(){if !good{c.Close()}}()
+ rawConn:=c
+ stopCancel:=context.AfterFunc(ctx,func(){rawConn.Close()});defer stopCancel()
+ deadline:=time.Now().Add(20*time.Second);if d,ok:=ctx.Deadline();ok && d.Before(deadline){deadline=d}
+ if err=c.SetDeadline(deadline);err!=nil{return nil,err}
+ if p.Scheme=="https" {
+  tc:=tls.Client(c,&tls.Config{MinVersion:tls.VersionTLS12,ServerName:p.Hostname(),RootCAs:roots})
+  if err=tc.HandshakeContext(ctx);err!=nil{return nil,err};c=tc
+ }
+ if _,err=fmt.Fprintf(c,"CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n",target,target);err!=nil{return nil,err}
+ rd:=bufio.NewReaderSize(c,4096)
+ statusBytes,err:=rd.ReadSlice('\n');if err!=nil{return nil,fmt.Errorf("invalid or oversized proxy status: %w",err)}
+ fields:=strings.Fields(string(statusBytes))
+ if len(fields)<2 || (fields[0]!="HTTP/1.1" && fields[0]!="HTTP/1.0") || fields[1]!="200"{return nil,errors.New("proxy CONNECT declined")}
+ total:=len(statusBytes)
+ for {
+  line,err:=rd.ReadSlice('\n');if err!=nil{return nil,fmt.Errorf("invalid or oversized proxy header: %w",err)}
+  total+=len(line);if total>16384{return nil,errors.New("proxy headers too large")}
+  if string(line)=="\r\n"{break}
+  if !strings.HasSuffix(string(line),"\r\n") || !strings.Contains(string(line),":"){return nil,errors.New("invalid proxy header")}
+ }
+ if err=c.SetDeadline(time.Time{});err!=nil{return nil,err}
+ good=true;return &bufferedConn{Conn:c,reader:rd},nil
 }
 
 type bufferedConn struct {
@@ -124,6 +102,7 @@ type bufferedConn struct {
 }
 
 func (b *bufferedConn) Read(p []byte) (int, error) { return b.reader.Read(p) }
+func (b *bufferedConn) CloseWrite()error{if half,ok:=b.Conn.(interface{CloseWrite()error});ok{return half.CloseWrite()};return b.Conn.Close()}
 func sshProxyCommand(exe string) (string, error) {
 	if strings.ContainsAny(exe, "\r\n\x00") {
 		return "", errors.New("invalid executable path")

@@ -76,7 +76,7 @@ func transferSFTP(ep Endpoint, local, remote string, upload bool) error {
 	if e = f.Close(); e != nil {
 		return e
 	}
-	args := []string{"-b", f.Name(), "-P", strconv.Itoa(ep.Port), "-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "-oConnectTimeout=15"}
+	args := []string{"-f", "-b", f.Name(), "-P", strconv.Itoa(ep.Port), "-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "-oConnectTimeout=15"}
 	if activeNetwork.Family == "ipv4" {
 		args = append(args, "-4")
 	} else if activeNetwork.Family == "ipv6" {
@@ -145,21 +145,19 @@ func sftpGet(source, dest string, port int) error {
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
-	id, e := randomHex(12)
-	if e != nil {
-		return e
-	}
-	part := filepath.Join(filepath.Dir(dest), ".xer-"+id+".part")
-	defer os.Remove(part)
-	if e = transferSFTP(ep, part, remote, false); e != nil {
-		return e
-	}
-	st, e := os.Stat(part)
-	if e != nil {
-		return e
-	}
-	if !st.Mode().IsRegular() {
-		return errors.New("download is not a regular file")
-	}
-	return os.Link(part, dest)
+	stage,e:=newDownloadStage(dest,downloadMetadata{Address:ep.Target,Pin:"OpenSSH-known-hosts",Name:remote,Digest:"sftp-no-resume"})
+	if e!=nil{return e};defer stage.Close()
+	// SFTP does not resume: safely truncate only an already verified private file.
+	f,e:=stage.root.OpenFile("part",os.O_CREATE|os.O_RDWR|safeReadFlags(),0600);if e!=nil{return e}
+	if e=validateOpenFile(f,true);e==nil{e=f.Truncate(0)};f.Close();if e!=nil{return e}
+	part:=filepath.Join(stage.root.Name(),"part")
+	if e=transferSFTP(ep,part,remote,false);e!=nil{return e}
+	f,e=stage.root.OpenFile("part",os.O_RDONLY|safeReadFlags(),0);if e!=nil{return e}
+	if e=validateOpenFile(f,true);e!=nil{f.Close();return e}
+	verified,e:=f.Stat();f.Close();if e!=nil{return e}
+	current,e:=stage.root.Lstat("part");if e!=nil || !current.Mode().IsRegular() || !os.SameFile(verified,current){return errors.New("SFTP partial changed before publication")}
+	if e=stage.parent.Link(filepath.Join(stage.name,"part"),stage.target);e!=nil{return e}
+	if e=stage.root.Remove("part");e!=nil{return fmt.Errorf("SFTP file published; cleanup failed: %w",e)}
+	if e=stage.root.Remove("metadata.json");e!=nil{return fmt.Errorf("SFTP file published; metadata cleanup failed: %w",e)}
+	return syncDirectory(filepath.Dir(dest))
 }

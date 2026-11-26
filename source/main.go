@@ -20,7 +20,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -34,7 +33,7 @@ import (
 	"time"
 )
 
-const version = "0.0"
+const version = "0.0.1-dev"
 const chunkSize int64 = 1024 * 1024
 const maxChunk int64 = 64 * 1024 * 1024
 const headerToken = "Authorization"
@@ -68,6 +67,15 @@ type Server struct {
 	token   string
 	certDER []byte
 	mu      sync.Mutex
+	initOnce sync.Once
+	slots chan struct{}
+	limits receiverLimits
+	pairingUntil time.Time
+ pairMu sync.Mutex
+ pairCount int
+	uploadLocks sync.Map
+ cacheMu sync.Mutex
+ digests map[string]cachedDigest
 }
 
 func main() {
@@ -77,6 +85,8 @@ func main() {
 	}
 }
 func run(args []string) error {
+ if len(args)>0 {switch args[0] {case "help","--help","-h": usage();return nil;case "version","--version","-v":fmt.Println("XER",version);return nil}}
+ if len(args)==2 && args[0]!="serve" && (args[1]=="--help" || args[1]=="-h") {usage();return nil}
 	cfg, cfgErr := readSettings()
 	if cfgErr != nil {
 		return cfgErr
@@ -128,6 +138,8 @@ COMMANDS
   get           Receive file
   auto          Manage YAML automation
   dns           Secure DNS lookup
+  trust         Approve, list or revoke device trust; forget receiver profiles
+  doctor        Show local configuration status
 
 OPTIONS
   --via         https | sftp (manual; required for transfers)
@@ -142,7 +154,7 @@ OPTIONS
   -v           Version
 
 EXAMPLES
-  xer serve
+  xer serve --pair-window 5m
   xer send file.txt 192.168.1.102 --via https
   xer get 192.168.1.102:file.txt --via https
   xer send file.txt admin@server --via sftp
@@ -157,8 +169,11 @@ ADVANCED
   xer auto list | remove NAME | install | uninstall | tick
 `, version)
 }
+var userConfigDir = os.UserConfigDir
+var userCacheDir = os.UserCacheDir
+
 func configDir() (string, error) {
-	p, err := os.UserConfigDir()
+	p, err := userConfigDir()
 	if err != nil {
 		return "", err
 	}
@@ -174,7 +189,7 @@ func loadProfiles() (Profiles, error) {
 	if err != nil {
 		return p, err
 	}
-	b, err := os.ReadFile(file)
+	b, err := readPrivate(file, 1<<20)
 	if errors.Is(err, os.ErrNotExist) {
 		return p, nil
 	}
@@ -184,13 +199,11 @@ func loadProfiles() (Profiles, error) {
 	if err = json.Unmarshal(b, &p); err != nil {
 		return p, err
 	}
-	if p.Servers == nil {
-		p.Servers = map[string]Profile{}
-	}
+	if p.Servers == nil { p.Servers=map[string]Profile{} }; for _,profile:=range p.Servers {if !goodHash(profile.Fingerprint){return p,errors.New("invalid receiver profile fingerprint")};host,port,e:=net.SplitHostPort(profile.Address);if e!=nil{return p,e};n,e:=strconv.Atoi(port);if e!=nil || host=="" || n<1 || n>65535 || strings.ContainsAny(host,"/\\\r\n\x00 \t@?#"){return p,errors.New("invalid receiver profile address")}}
 	return p, nil
 }
 func storeJSON(path string, v any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	if err := privateDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(v, "", "  ")
@@ -203,6 +216,7 @@ func storeJSON(path string, v any) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
+	if err = protectPath(tmp.Name(), false); err != nil { tmp.Close(); return err }
 	if err = tmp.Chmod(0600); err != nil {
 		tmp.Close()
 		return err
@@ -218,68 +232,7 @@ func storeJSON(path string, v any) error {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
-}
-func pinNormalize(s string) (string, error) {
-	s = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), ":", ""))
-	if len(s) != 64 {
-		return "", errors.New("TLS fingerprint must be 64 hexadecimal characters (SHA-256)")
-	}
-	if _, err := hex.DecodeString(s); err != nil {
-		return "", err
-	}
-	return s, nil
-}
-func connect(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: xer connect add NAME HOST:PORT SHA256_PIN | list")
-	}
-	switch args[0] {
-	case "add":
-		if len(args) != 4 {
-			return errors.New("usage: xer connect add NAME HOST:PORT SHA256_PIN")
-		}
-		name := args[1]
-		if name == "" || strings.ContainsAny(name, ":/\\ \t\n") {
-			return errors.New("invalid connection name")
-		}
-		addr := args[2]
-		if _, _, err := net.SplitHostPort(addr); err != nil {
-			return fmt.Errorf("address must be HOST:PORT: %w", err)
-		}
-		pin, err := pinNormalize(args[3])
-		if err != nil {
-			return err
-		}
-		p, err := loadProfiles()
-		if err != nil {
-			return err
-		}
-		p.Servers[name] = Profile{addr, pin}
-		file, err := configFile()
-		if err != nil {
-			return err
-		}
-		if err := storeJSON(file, p); err != nil {
-			return err
-		}
-		fmt.Printf("Saved %s -> %s (pinned TLS)\n", name, addr)
-		return nil
-	case "list":
-		if len(args) != 1 {
-			return errors.New("usage: xer connect list")
-		}
-		p, err := loadProfiles()
-		if err != nil {
-			return err
-		}
-		for name, v := range p.Servers {
-			fmt.Printf("%s\t%s\t%s\n", name, v.Address, v.Fingerprint)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unknown connect action: %s", args[0])
-	}
+	if err = os.Rename(tmp.Name(), path); err != nil { return err }; return syncDirectory(filepath.Dir(path))
 }
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
@@ -287,6 +240,9 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+func optionalToken() (string, error) {
+ if os.Getenv("XER_TOKEN")=="" && os.Getenv("XER_TOKEN_FILE")=="" { return "",nil }; return tokenValue()
 }
 func tokenValue() (string, error) {
 	if s := strings.TrimSpace(os.Getenv("XER_TOKEN")); s != "" {
@@ -300,7 +256,7 @@ func tokenValue() (string, error) {
 		if runtime.GOOS != "windows" && st.Mode().Perm()&0077 != 0 {
 			return "", errors.New("token file permissions must be owner-only (chmod 600)")
 		}
-		b, err := os.ReadFile(f)
+		b, err := readPrivate(f, 65536)
 		if err != nil {
 			return "", err
 		}
@@ -311,6 +267,7 @@ func tokenValue() (string, error) {
 	return "", errors.New("set XER_TOKEN or XER_TOKEN_FILE to a shared secret")
 }
 func validName(name string) bool {
+ base:=strings.TrimRight(strings.ToUpper(strings.SplitN(name,".",2)[0])," ."); if base=="CON" || base=="PRN" || base=="AUX" || base=="NUL" || base=="CONIN$" || base=="CONOUT$" {return false}; for _,prefix:=range []string{"COM","LPT"} { if strings.HasPrefix(base,prefix) && strings.Contains("123456789¹²³",strings.TrimPrefix(base,prefix)) && len([]rune(strings.TrimPrefix(base,prefix)))==1 {return false} }
 	if name == "" || name == "." || name == ".." || len(name) > 220 || strings.HasPrefix(strings.ToLower(name), ".xer-") || strings.ContainsAny(name, "/\\<>:\"|?*\x00") || strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
 		return false
 	}
@@ -343,9 +300,8 @@ func shaFile(path string) (string, error) {
 func makeCert(dir string) (tls.Certificate, string, error) {
 	certPath := filepath.Join(dir, "receiver.crt")
 	keyPath := filepath.Join(dir, "receiver.key")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return tls.Certificate{}, "", err
-	}
+	if err := privateDir(dir); err != nil {return tls.Certificate{},"",err}
+	identityLock,err := acquireLock(filepath.Join(dir,"identity.lock")); if err != nil {return tls.Certificate{},"",err}; defer identityLock.Close()
 	if _, err := os.Stat(certPath); errors.Is(err, os.ErrNotExist) {
 		if _, e := os.Stat(keyPath); e == nil {
 			return tls.Certificate{}, "", errors.New("private key exists without certificate")
@@ -358,7 +314,7 @@ func makeCert(dir string) (tls.Certificate, string, error) {
 		if err != nil {
 			return tls.Certificate{}, "", err
 		}
-		template := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "XER Secure Receiver"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(1, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true, DNSNames: []string{"localhost"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}}
+		template := x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "XER Secure Receiver"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(1, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth,x509.ExtKeyUsageClientAuth}, BasicConstraintsValid: true, DNSNames: []string{"localhost"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}}
 		der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 		if err != nil {
 			return tls.Certificate{}, "", err
@@ -367,19 +323,22 @@ func makeCert(dir string) (tls.Certificate, string, error) {
 		if err != nil {
 			return tls.Certificate{}, "", err
 		}
-		if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: private}), 0600); err != nil {
+		if err := writeExclusive(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: private})); err != nil {
 			return tls.Certificate{}, "", err
 		}
-		if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
+		if err := writeExclusive(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})); err != nil {
 			return tls.Certificate{}, "", err
 		}
 	} else if err != nil {
 		return tls.Certificate{}, "", err
 	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	certPEM,err := readPrivate(certPath,65536);if err != nil {return tls.Certificate{},"",err}
+	keyPEM,err := readPrivate(keyPath,65536);if err != nil {return tls.Certificate{},"",err}
+	cert, err := tls.X509KeyPair(certPEM,keyPEM)
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}
+	parsed,err := x509.ParseCertificate(cert.Certificate[0]);if err != nil {return tls.Certificate{},"",err};if err=certValid(parsed);err!=nil {return tls.Certificate{},"",fmt.Errorf("identity certificate expired; rotate identity and pair again: %w",err)}
 	fp := sha256.Sum256(cert.Certificate[0])
 	return cert, hex.EncodeToString(fp[:]), nil
 }
@@ -387,16 +346,19 @@ func serveCommand(args []string) error {
 	f := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dir := f.String("dir", ".", "destination folder")
 	listen := f.String("listen", fmt.Sprintf(":%d", activeSettings.Port), "bind address")
+	maxFile := f.Int64("max-file-size",64<<30,"maximum file size in bytes")
+	maxStorage := f.Int64("max-storage",128<<30,"published plus pending bytes quota")
+	maxPending := f.Int("max-pending",128,"maximum incomplete uploads")
+	maxConcurrent := f.Int("max-concurrent",8,"maximum concurrent authenticated requests")
+	pairWindow := f.Duration("pair-window", 0, "accept new pairing sessions for at most 10m (disabled by default)")
 	if err := f.Parse(args); err != nil {
-		return err
+		if errors.Is(err,flag.ErrHelp){return nil};return err
 	}
 	if f.NArg() != 0 {
 		return errors.New("unexpected serve arguments")
 	}
-	token := os.Getenv("XER_TOKEN")
-	if token == "" && os.Getenv("XER_TOKEN_FILE") != "" {
-		token, _ = tokenValue()
-	}
+	token, tokenErr := optionalToken()
+	if tokenErr != nil { return tokenErr }
 	root, err := filepath.Abs(*dir)
 	if err != nil {
 		return err
@@ -404,18 +366,25 @@ func serveCommand(args []string) error {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return err
 	}
+	if *pairWindow < 0 || *pairWindow > 10*time.Minute { return errors.New("pair-window must be 0..10m") }
+	if err := trustedDirectory(root); err != nil { return err }
 	state := filepath.Join(root, ".xer-data")
+	receiverLock, err := acquireLock(filepath.Join(state,"receiver.lock")); if err != nil { return err }; defer receiverLock.Close()
 	cert, fp, err := makeCert(state)
 	if err != nil {
 		return err
 	}
-	srv := &Server{root: root, token: token, certDER: cert.Certificate[0]}
+	if *maxFile<1 || *maxStorage<*maxFile || *maxPending<1 || *maxPending>1024 || *maxConcurrent<1 || *maxConcurrent>64 {return errors.New("invalid receiver limits")}
+	srv := &Server{root: root, token: token, certDER: cert.Certificate[0],limits:receiverLimits{MaxFile:*maxFile,MaxStorage:*maxStorage,MaxPending:*maxPending,Concurrent:*maxConcurrent}}
+	if err=srv.recoverState();err!=nil{return err}
+	if *pairWindow>0 { srv.pairingUntil=time.Now().Add(*pairWindow) }
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pair", srv.pair)
+	mux.HandleFunc("/v1/pair/", srv.pairAction)
 	mux.HandleFunc("/v1/uploads", srv.auth(srv.uploadInit))
 	mux.HandleFunc("/v1/uploads/", srv.auth(srv.uploadAction))
 	mux.HandleFunc("/v1/files/", srv.auth(srv.download))
-	server := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, ClientAuth: tls.RequestClientCert}}
+	server := &http.Server{Addr: *listen, Handler: srv.limitResponse(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 2*time.Minute, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, ClientAuth: tls.RequestClientCert}}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -425,11 +394,14 @@ func serveCommand(args []string) error {
 		fmt.Println("LAN receiver:", net.JoinHostPort(addr, strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)))
 	}
 	_ = fp
-	fmt.Println("First-time senders can pair by comparing the code displayed on both computers.")
-	return server.Serve(tls.NewListener(ln, server.TLSConfig))
+	fmt.Println("Pairing requires an explicit --pair-window and local xer trust approve SESSION CODE.")
+	return server.Serve(tls.NewListener(&boundedListener{Listener:ln,slots:make(chan struct{},64)}, server.TLSConfig))
 }
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		s.initLimits()
+		select { case s.slots<-struct{}{}: defer func(){<-s.slots}(); default: http.Error(w,"receiver busy",503); return }
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.limits.BodyTimeout))
 		w.Header().Set("Cache-Control", "no-store")
 		provided := strings.TrimPrefix(r.Header.Get(headerToken), "Bearer ")
 		if !s.paired(r) && (s.token == "" || len(provided) != len(s.token) || !secureEqual(provided, s.token)) {
@@ -449,21 +421,22 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-func readJSON(r *http.Request, v any) error {
-	defer r.Body.Close()
-	d := json.NewDecoder(io.LimitReader(r.Body, 1<<16))
-	d.DisallowUnknownFields()
-	return d.Decode(v)
+func readJSON(r *http.Request,v any)error{
+ defer r.Body.Close()
+ data,err:=io.ReadAll(io.LimitReader(r.Body,(1<<16)+1));if err!=nil{return err};if len(data)>1<<16{return errors.New("JSON body exceeds size limit")}
+ d:=json.NewDecoder(bytes.NewReader(data));d.DisallowUnknownFields();if err=d.Decode(v);err!=nil{return err}
+ var extra any;if err=d.Decode(&extra);err!=io.EOF{return errors.New("trailing or invalid JSON data")};return nil
 }
 func (s *Server) statePath(id string) string { return filepath.Join(s.root, ".xer-data", id+".json") }
 func (s *Server) partPath(id string) string  { return filepath.Join(s.root, ".xer-data", id+".part") }
 func (s *Server) loadUpload(id string) (Upload, error) {
 	var u Upload
-	b, e := os.ReadFile(s.statePath(id))
+	b, e := readPrivate(s.statePath(id), 8<<20)
 	if e != nil {
 		return u, e
 	}
 	e = json.Unmarshal(b, &u)
+	if e==nil { e=s.validateUpload(u,id) }
 	return u, e
 }
 func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
@@ -476,7 +449,9 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", 400)
 		return
 	}
-	if !validName(req.Name) || req.Size < 0 || req.ChunkSize <= 0 || req.ChunkSize > maxChunk || !goodHash(req.SHA256) {
+	req.SHA256=strings.ToLower(req.SHA256)
+	s.initLimits()
+	if !validName(req.Name) || req.Size < 0 || req.Size>s.limits.MaxFile || req.ChunkSize <= 0 || req.ChunkSize > maxChunk || !goodHash(req.SHA256) || chunkCount(req.Size,req.ChunkSize)>s.limits.MaxChunks {
 		http.Error(w, "invalid upload metadata", 400)
 		return
 	}
@@ -489,17 +464,18 @@ func (s *Server) uploadInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "destination unavailable", 500)
 		return
 	}
+	if err := s.reserveUpload(req.Size); err != nil { http.Error(w,err.Error(),507); return }
 	id, err := randomHex(16)
 	if err != nil {
 		http.Error(w, "internal error", 500)
 		return
 	}
-	p, err := os.OpenFile(s.partPath(id), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	p, err := openPrivate(s.partPath(id), os.O_CREATE|os.O_EXCL|os.O_WRONLY)
 	if err != nil {
 		http.Error(w, "storage error", 500)
 		return
 	}
-	p.Close()
+	if err=p.Close();err!=nil{_ = os.Remove(s.partPath(id));http.Error(w,"part creation failed",500);return}
 	u := Upload{ID: id, Name: req.Name, Size: req.Size, ChunkSize: req.ChunkSize, SHA256: req.SHA256, Received: map[int64]string{}}
 	if err := storeJSON(s.statePath(id), u); err != nil {
 		os.Remove(s.partPath(id))
@@ -525,10 +501,13 @@ func (s *Server) uploadAction(w http.ResponseWriter, r *http.Request) {
 		s.putChunk(w, r, id, index)
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if _,err:=s.loadUpload(id);err!=nil{http.NotFound(w,r);return}
+	mu := s.uploadMutex(id)
+	mu.Lock()
+	defer mu.Unlock()
 	u, err := s.loadUpload(id)
 	if err != nil {
+		s.uploadLocks.Delete(id)
 		http.NotFound(w, r)
 		return
 	}
@@ -537,16 +516,14 @@ func (s *Server) uploadAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 2 && parts[1] == "complete" && r.Method == http.MethodPost {
-		s.complete(w, u)
+		s.complete(w, r, u)
 		return
 	}
 	http.Error(w, "method not allowed", 405)
 }
 func isHex(s string) bool { _, e := hex.DecodeString(s); return e == nil }
 func (s *Server) putChunk(w http.ResponseWriter, r *http.Request, id string, index int64) {
-	s.mu.Lock()
 	u, err := s.loadUpload(id)
-	s.mu.Unlock()
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -597,10 +574,12 @@ func (s *Server) putChunk(w http.ResponseWriter, r *http.Request, id string, ind
 	}
 	// Buffer and authenticate the chunk before taking the state lock; chunks
 	// may arrive concurrently but storage metadata updates are serialized.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	mu := s.uploadMutex(id)
+	mu.Lock()
+	defer mu.Unlock()
 	u, err = s.loadUpload(id)
 	if err != nil {
+		s.uploadLocks.Delete(id)
 		http.NotFound(w, r)
 		return
 	}
@@ -612,7 +591,7 @@ func (s *Server) putChunk(w http.ResponseWriter, r *http.Request, id string, ind
 		}
 		return
 	}
-	f, err := os.OpenFile(s.partPath(u.ID), os.O_WRONLY, 0600)
+	f, err := openPrivate(s.partPath(u.ID), os.O_WRONLY)
 	if err != nil {
 		http.Error(w, "storage error", 500)
 		return
@@ -639,8 +618,8 @@ func (s *Server) putChunk(w http.ResponseWriter, r *http.Request, id string, ind
 	}
 	w.WriteHeader(204)
 }
-func (s *Server) complete(w http.ResponseWriter, u Upload) {
-	count := (u.Size + u.ChunkSize - 1) / u.ChunkSize
+func (s *Server) complete(w http.ResponseWriter, r *http.Request, u Upload) {
+	count := chunkCount(u.Size,u.ChunkSize)
 	if int64(len(u.Received)) != count {
 		http.Error(w, "missing chunks", 409)
 		return
@@ -650,7 +629,7 @@ func (s *Server) complete(w http.ResponseWriter, u Upload) {
 		http.Error(w, "wrong file size", 409)
 		return
 	}
-	digest, err := shaFile(s.partPath(u.ID))
+	digest, err := shaFileContext(r.Context(),s.partPath(u.ID))
 	if err != nil || digest != u.SHA256 {
 		http.Error(w, "full file hash mismatch", 422)
 		return
@@ -664,8 +643,10 @@ func (s *Server) complete(w http.ResponseWriter, u Upload) {
 		}
 		return
 	}
-	os.Remove(s.partPath(u.ID))
-	os.Remove(s.statePath(u.ID))
+	if err := os.Remove(s.partPath(u.ID)); err != nil { http.Error(w,"published but partial cleanup failed",500); return }
+	if err := os.Remove(s.statePath(u.ID)); err != nil { http.Error(w,"published but metadata cleanup failed",500); return }
+	if err := syncDirectory(s.root); err != nil { http.Error(w,"published but directory sync failed",500); return }
+	s.uploadLocks.Delete(u.ID)
 	writeJSON(w, 200, map[string]string{"sha256": digest, "file": u.Name})
 }
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
@@ -684,26 +665,25 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := os.Open(path)
+	f, err := openDownloadSource(s.root, name)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		http.Error(w, "file read error", 500)
-		return
-	}
+	st, err = f.Stat()
+	if err != nil { http.Error(w,"file stat error",500); return }
+	digest,err:=s.fileDigest(name,f)
+	if err!=nil {http.Error(w,"file read/hash error",500);return}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		http.Error(w, "file seek error", 500)
 		return
 	}
-	w.Header().Set("X-File-SHA256", hex.EncodeToString(h.Sum(nil)))
+	w.Header().Set("X-File-SHA256", digest)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, name, st.ModTime(), f)
 }
-func clientFor(p Profile, token string) *http.Client {
+func clientFor(p Profile, token string) (*http.Client, error) {
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true, VerifyConnection: func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) < 1 {
 			return errors.New("missing peer certificate")
@@ -720,29 +700,19 @@ func clientFor(p Profile, token string) *http.Client {
 		return nil
 	}}, Proxy: http.ProxyFromEnvironment, MaxIdleConns: 8, MaxIdleConnsPerHost: 8, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 45 * time.Second, TLSHandshakeTimeout: 15 * time.Second}
 	if err := configureHTTPTransport(transport); err != nil {
-		return nil
+		return nil, err
 	}
 	if token == "" {
 		if err := clientIdentityTLS(transport.TLSClientConfig); err != nil {
-			return nil
+			return nil, err
 		}
 	}
 	return &http.Client{Transport: transport, Timeout: 0, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 		return errors.New("redirect forbidden for XER file transfer")
-	}}
-}
-func getProfile(name string) (Profile, error) {
-	profiles, err := loadProfiles()
-	if err != nil {
-		return Profile{}, err
-	}
-	p, ok := profiles.Servers[name]
-	if !ok {
-		return p, fmt.Errorf("unknown server %q; run xer connect add", name)
-	}
-	return p, nil
+	}}, nil
 }
 func request(client *http.Client, token, method, urlStr string, body io.Reader) (*http.Response, error) {
+	if client == nil { return nil, errors.New("HTTPS client was not initialized") }
 	req, err := http.NewRequestWithContext(context.Background(), method, urlStr, body)
 	if err != nil {
 		return nil, err
@@ -758,7 +728,7 @@ func checkStatus(resp *http.Response, code int) error {
 	return fmt.Errorf("remote HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 }
 func clientStateDir() (string, error) {
-	d, e := os.UserCacheDir()
+	d, e := userCacheDir()
 	if e != nil {
 		return "", e
 	}
@@ -766,6 +736,7 @@ func clientStateDir() (string, error) {
 }
 func sendFile(path, alias string) error { return sendFileWithOptions(path, alias, chunkSize, 1) }
 func sendFileWithOptions(path, alias string, selectedChunk int64, parallel int) error {
+	if selectedChunk<1 || selectedChunk>maxChunk {return errors.New("chunk must be 1B..64MiB")}
 	if parallel < 1 || parallel > 8 {
 		return errors.New("parallel must be between 1 and 8")
 	}
@@ -773,10 +744,8 @@ func sendFileWithOptions(path, alias string, selectedChunk int64, parallel int) 
 	if err != nil {
 		return err
 	}
-	token := os.Getenv("XER_TOKEN")
-	if token == "" && os.Getenv("XER_TOKEN_FILE") != "" {
-		token, _ = tokenValue()
-	}
+	token, tokenErr := optionalToken()
+	if tokenErr != nil { return tokenErr }
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -796,26 +765,37 @@ func sendFileWithOptions(path, alias string, selectedChunk int64, parallel int) 
 	if err != nil {
 		return err
 	}
-	stateKey := sha256.Sum256([]byte(p.Address + "|" + p.Fingerprint + "|" + abs + "|" + strconv.FormatInt(info.Size(), 10) + "|" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "|" + digest))
+	stateKey := sha256.Sum256([]byte(p.Address + "|" + p.Fingerprint + "|" + abs + "|" + strconv.FormatInt(info.Size(), 10) + "|" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "|" + digest + "|" + strconv.FormatInt(selectedChunk, 10)))
 	stateDir, err := clientStateDir()
 	if err != nil {
 		return err
 	}
 	statePath := filepath.Join(stateDir, hex.EncodeToString(stateKey[:])+".json")
-	client := clientFor(p, token)
+	sendLock,err:=acquireLock(statePath+".lock");if err!=nil{return err};defer sendLock.Close()
+	client, err := clientFor(p, token)
+	if err != nil {
+		return err
+	}
+	defer client.CloseIdleConnections()
 	base := "https://" + p.Address
 	id := ""
 	var state InitResponse
-	if b, e := os.ReadFile(statePath); e == nil && json.Unmarshal(b, &state) == nil && len(state.ID) == 32 && isHex(state.ID) {
+	if b, e := readPrivate(statePath,65536); e == nil && json.Unmarshal(b, &state) == nil && len(state.ID) == 32 && isHex(state.ID) {
 		id = state.ID
 		resp, e := request(client, token, "GET", base+"/v1/uploads/"+id, nil)
 		if e != nil {
 			return e
 		}
-		if resp.StatusCode != 200 {
-			id = ""
-		}
+		status:=resp.StatusCode
 		resp.Body.Close()
+		if status==404 {
+			completed,e:=request(client,token,"HEAD",base+"/v1/files/"+url.PathEscape(name),nil)
+			if e!=nil{return e}
+			matched:=completed.StatusCode==200 && completed.Header.Get("X-File-SHA256")==digest && completed.ContentLength==info.Size()
+			completed.Body.Close()
+			if matched {if e=os.Remove(statePath);e!=nil{return e};fmt.Println("Upload already committed; verified receiver digest.");return nil}
+			id=""
+		} else if status!=200 {return fmt.Errorf("resume status HTTP %d",status)}
 	}
 	if id == "" {
 		requestBody, _ := json.Marshal(InitRequest{Name: name, Size: info.Size(), ChunkSize: selectedChunk, SHA256: digest})
@@ -847,7 +827,7 @@ func sendFileWithOptions(path, alias string, selectedChunk int64, parallel int) 
 		return err
 	}
 	var remote Upload
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&remote); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&remote); err != nil {
 		resp.Body.Close()
 		return err
 	}
@@ -860,7 +840,7 @@ func sendFileWithOptions(path, alias string, selectedChunk int64, parallel int) 
 		return err
 	}
 	defer f.Close()
-	chunks := (info.Size() + selectedChunk - 1) / selectedChunk
+	chunks := chunkCount(info.Size(),selectedChunk)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	queue := make(chan int64)
@@ -949,137 +929,9 @@ feed:
 		return firstErr
 	}
 	fmt.Println()
-	resp, err = request(client, token, "POST", base+"/v1/uploads/"+id+"/complete", nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if err := checkStatus(resp, 200); err != nil {
-		return err
-	}
-	os.Remove(statePath)
+	if err=completeUpload(client,token,base+"/v1/uploads/"+id+"/complete");err!=nil{return err}
+	if err := os.Remove(statePath); err != nil && !errors.Is(err,os.ErrNotExist) { return fmt.Errorf("upload complete; cache cleanup: %w",err) }
 	fmt.Printf("Upload complete: %s\n", name)
-	return nil
-}
-func getFile(source, dest string) error {
-	colon := strings.LastIndexByte(source, ':')
-	if colon < 1 || colon == len(source)-1 {
-		return errors.New("expected SERVER:FILENAME")
-	}
-	alias, name := source[:colon], source[colon+1:]
-	if !validName(name) {
-		return errors.New("invalid remote filename")
-	}
-	if dest == "" {
-		dest = name
-	}
-	if strings.HasSuffix(dest, string(os.PathSeparator)) {
-		dest = filepath.Join(dest, name)
-	}
-	if _, err := os.Lstat(dest); err == nil {
-		return errors.New("destination already exists (refusing overwrite)")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	p, err := getOrPair(alias)
-	if err != nil {
-		return err
-	}
-	token := os.Getenv("XER_TOKEN")
-	if token == "" && os.Getenv("XER_TOKEN_FILE") != "" {
-		token, _ = tokenValue()
-	}
-	client := clientFor(p, token)
-	endpoint := "https://" + p.Address + "/v1/files/" + url.PathEscape(name)
-	resp, err := request(client, token, "HEAD", endpoint, nil)
-	if err != nil {
-		return err
-	}
-	if err := checkStatus(resp, 200); err != nil {
-		resp.Body.Close()
-		return err
-	}
-	digest := resp.Header.Get("X-File-SHA256")
-	size, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-	resp.Body.Close()
-	if err != nil || size < 0 || !goodHash(digest) {
-		return errors.New("invalid remote file metadata")
-	}
-	partial := dest + ".xer-part"
-	f, err := os.OpenFile(partial, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	stat, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	offset := stat.Size()
-	if offset > size {
-		return errors.New("partial file larger than remote; remove .xer-part and retry")
-	}
-	if offset < size {
-		req, err := http.NewRequest("GET", endpoint, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set(headerToken, "Bearer "+token)
-		if offset > 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
-		}
-		expected := 200
-		if offset > 0 {
-			expected = 206
-		}
-		if err := checkStatus(resp, expected); err != nil {
-			resp.Body.Close()
-			return err
-		}
-		if offset > 0 {
-			cr := resp.Header.Get("Content-Range")
-			if !strings.HasPrefix(cr, fmt.Sprintf("bytes %d-", offset)) {
-				resp.Body.Close()
-				return errors.New("unexpected Content-Range")
-			}
-		}
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			resp.Body.Close()
-			return err
-		}
-		n, copyErr := io.Copy(f, io.LimitReader(resp.Body, size-offset+1))
-		resp.Body.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		if n != size-offset {
-			return fmt.Errorf("incomplete download: got %d of %d bytes", n, size-offset)
-		}
-		if err := f.Sync(); err != nil {
-			return err
-		}
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	actual, err := shaFile(partial)
-	if err != nil {
-		return err
-	}
-	if actual != digest {
-		return errors.New("download SHA-256 mismatch; partial file preserved for inspection")
-	}
-	if err := os.Link(partial, dest); err != nil {
-		return fmt.Errorf("could not publish file without overwriting: %w", err)
-	}
-	if err := os.Remove(partial); err != nil {
-		return err
-	}
-	fmt.Printf("Download complete: %s\n", dest)
 	return nil
 }
 func doctor() error {
@@ -1095,8 +947,8 @@ func doctor() error {
 		fmt.Println("Access token: available")
 	}
 	fmt.Println("Transport: native HTTPS/TLS 1.3 with pinned receiver certificate")
-	fmt.Println("Chunk upload: 1 MiB, SHA-256 per chunk + full-file verification")
+	fmt.Printf("Chunk upload: %d bytes, %d worker(s), per-chunk + full SHA-256\n",activeSettings.Chunk,activeSettings.Parallel)
 	return nil
 }
 
-var _ = log.Print // reserve standard logger for future diagnostic output
+

@@ -37,6 +37,7 @@ func scheduleAction(action string) error {
 func systemdArg(path string) string {
 	// Systemd specifier expansion is disabled by doubling %.
 	path = strings.ReplaceAll(path, "%", "%%")
+	path = strings.ReplaceAll(path,"$","$$")
 	path = strings.ReplaceAll(path, "\\", "\\\\")
 	path = strings.ReplaceAll(path, "\"", "\\\"")
 	return "\"" + path + "\""
@@ -100,7 +101,8 @@ func scheduleLinux(action, exe string) error {
 func scheduleWindows(action, exe string) error {
 	switch action {
 	case "install":
-		quoted := "\\\"" + exe + "\\\" auto tick"
+		if strings.ContainsAny(exe,"%\"\r\n\x00"){return errors.New("unsafe executable path for Windows scheduler")}
+		quoted := "\"" + exe + "\" auto tick"
 		return runCmd("schtasks", "/Create", "/F", "/SC", "MINUTE", "/MO", "1", "/TN", "XER-Auto", "/TR", quoted)
 	case "uninstall":
 		return runCmd("schtasks", "/Delete", "/F", "/TN", "XER-Auto")

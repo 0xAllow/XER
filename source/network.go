@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+ "crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -42,7 +43,7 @@ func readSettings() (settings, error) {
 	if e != nil {
 		return s, e
 	}
-	raw, e := os.ReadFile(filepath.Join(filepath.Dir(exe), "config.toml"))
+	raw, e := readBoundedRegular(filepath.Join(filepath.Dir(exe), "config.toml"),65536)
 	if errors.Is(e, os.ErrNotExist) {
 		return s, nil
 	}
@@ -147,41 +148,35 @@ func validatedProxy(p string) (*url.URL, error) {
 	}
 	return u, nil
 }
-func configureHTTPTransport(t *http.Transport) error {
-	p, e := validatedProxy(activeNetwork.Proxy)
-	if e != nil {
-		return e
-	}
-	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialNetwork(ctx, network, addr, activeNetwork.Family)
-	}
-	if p == nil {
-		t.Proxy = nil
-		return nil
-	}
-	if p.Scheme == "socks5" || p.Scheme == "socks5h" {
-		// SOCKS5h always forwards names to the proxy. No local target DNS lookup.
-		t.Proxy = nil
-		t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialSOCKS5(ctx, p.Host, addr)
-		}
-		return nil
-	}
-	t.Proxy = http.ProxyURL(p)
-	return nil
+func configureHTTPTransport(t *http.Transport) error { return configureHTTPTransportWithProxyRoots(t,nil) }
+
+// Outer proxy TLS has an independent PKI policy and never receives the XER
+// identity or receiver VerifyConnection callback. No HTTP transport proxy path
+// is left that could accidentally reuse TLSClientConfig for the outer hop.
+func configureHTTPTransportWithProxyRoots(t *http.Transport, roots *x509.CertPool) error {
+ options:=activeNetwork
+ p,err:=validatedProxy(options.Proxy);if err!=nil{return err}
+ t.Proxy=nil
+ t.DialContext=func(ctx context.Context,network,addr string)(net.Conn,error){
+  if p==nil{return dialNetwork(ctx,network,addr,options.Family)}
+  switch p.Scheme {
+  case "socks5","socks5h":return dialSOCKS5Family(ctx,p.Host,addr,options.Family)
+  case "http","https":return dialHTTPProxyContext(ctx,p,addr,options.Family,roots)
+  default:return nil,errors.New("unsupported proxy")
+  }
+ }
+ return nil
 }
-func dialNetwork(ctx context.Context, network, addr, family string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 15 * time.Second, FallbackDelay: 200 * time.Millisecond}
-	switch family {
-	case "ipv4":
-		return d.DialContext(ctx, "tcp4", addr)
-	case "ipv6":
-		return d.DialContext(ctx, "tcp6", addr)
-	}
-	return d.DialContext(ctx, network, addr)
+func dialNetwork(ctx context.Context,network,addr,family string)(net.Conn,error){
+ d:=net.Dialer{Timeout:15*time.Second,FallbackDelay:200*time.Millisecond}
+ if family=="ipv4"{network="tcp4"} else if family=="ipv6"{network="tcp6"}
+ c,err:=d.DialContext(ctx,network,addr);if err!=nil{return nil,err}
+ idle:=2*time.Minute;if requested,ok:=ctx.Value(networkIdleContextKey{}).(time.Duration);ok && requested>0 && requested<=30*time.Minute{idle=requested}
+ return &idleConn{Conn:c,idle:idle},nil
 }
-func dialSOCKS5(ctx context.Context, proxyAddr, target string) (net.Conn, error) {
-	conn, e := dialNetwork(ctx, "tcp", proxyAddr, activeNetwork.Family)
+func dialSOCKS5(ctx context.Context, proxyAddr, target string) (net.Conn, error) { return dialSOCKS5Family(ctx,proxyAddr,target,activeNetwork.Family) }
+func dialSOCKS5Family(ctx context.Context, proxyAddr, target,family string) (net.Conn, error) {
+	conn, e := dialNetwork(ctx, "tcp", proxyAddr, family)
 	if e != nil {
 		return nil, e
 	}
@@ -195,7 +190,8 @@ func dialSOCKS5(ctx context.Context, proxyAddr, target string) (net.Conn, error)
 	if d, yes := ctx.Deadline(); yes && d.Before(deadline) {
 		deadline = d
 	}
-	conn.SetDeadline(deadline)
+	stopCancel:=context.AfterFunc(ctx,func(){conn.Close()});defer stopCancel()
+	if e=conn.SetDeadline(deadline);e!=nil{return nil,e}
 	if _, e = conn.Write([]byte{5, 1, 0}); e != nil {
 		return nil, e
 	}
@@ -261,7 +257,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr, target string) (net.Conn, error)
 	if e != nil {
 		return nil, e
 	}
-	conn.SetDeadline(time.Time{})
+	if e=conn.SetDeadline(time.Time{});e!=nil{return nil,e}
 	ok = true
 	return conn, nil
 }
@@ -281,6 +277,7 @@ func extractNetworkArgs(args []string) ([]string, func(), error) {
 				reset()
 				return nil, reset, errors.New("--proxy requires URL")
 			}
+			if args[i]=="" {reset();return nil,reset,errors.New("--proxy requires a nonempty URL; use --no-proxy to select direct networking")}
 			if _, e := validatedProxy(args[i]); e != nil {
 				reset()
 				return nil, reset, e
@@ -311,7 +308,7 @@ func extractNetworkArgs(args []string) ([]string, func(), error) {
 				reset()
 				return nil, reset, errors.New("port must be 1..65535")
 			}
-			activeSFTPPort = n // HTTPS per-command port is accepted when destination includes HOST:PORT.
+			activeSFTPPort = n // SFTP only; HTTPS carries its port in HOST:PORT.
 		default:
 			result = append(result, args[i])
 		}

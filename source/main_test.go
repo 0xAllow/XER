@@ -16,8 +16,15 @@ import (
 	"testing"
 )
 
+func isolateUserState(t *testing.T) {
+ t.Helper();cfg,cache:=t.TempDir(),t.TempDir();oldCfg,oldCache:=userConfigDir,userCacheDir
+ userConfigDir=func()(string,error){return cfg,nil};userCacheDir=func()(string,error){return cache,nil}
+ t.Cleanup(func(){userConfigDir=oldCfg;userCacheDir=oldCache})
+}
+
 func testReceiver(t *testing.T) (string, Profile, string, *http.Client) {
 	t.Helper()
+	isolateUserState(t)
 	root := t.TempDir()
 	token := "test-secret-from-test"
 	srv := &Server{root: root, token: token}
@@ -35,8 +42,6 @@ func testReceiver(t *testing.T) (string, Profile, string, *http.Client) {
 	raw := ts.TLS.Certificates[0].Certificate[0]
 	digest := sha256.Sum256(raw)
 	p := Profile{Address: strings.TrimPrefix(ts.URL, "https://"), Fingerprint: hex.EncodeToString(digest[:])}
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	t.Setenv("XER_TOKEN", token)
 	profiles := Profiles{Servers: map[string]Profile{"local": p}}
 	config, err := configFile()
@@ -46,7 +51,11 @@ func testReceiver(t *testing.T) (string, Profile, string, *http.Client) {
 	if err := storeJSON(config, profiles); err != nil {
 		t.Fatal(err)
 	}
-	return root, p, token, clientFor(p, token)
+	client, err := clientFor(p, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root, p, token, client
 }
 func TestSecureChunkedUploadDownload(t *testing.T) {
 	root, _, _, _ := testReceiver(t)
@@ -119,7 +128,7 @@ func TestResumeUpload(t *testing.T) {
 	}
 	info, _ := os.Stat(source)
 	abs, _ := filepath.Abs(source)
-	key := sha256.Sum256([]byte(p.Address + "|" + p.Fingerprint + "|" + abs + "|" + strconv.FormatInt(info.Size(), 10) + "|" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "|" + digest))
+	key := sha256.Sum256([]byte(p.Address + "|" + p.Fingerprint + "|" + abs + "|" + strconv.FormatInt(info.Size(), 10) + "|" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + "|" + digest + "|" + strconv.FormatInt(chunkSize, 10)))
 	sd, _ := clientStateDir()
 	if err := storeJSON(filepath.Join(sd, hex.EncodeToString(key[:])+".json"), state); err != nil {
 		t.Fatal(err)
@@ -146,7 +155,10 @@ func TestAuthAndPinning(t *testing.T) {
 		t.Fatalf("expected 401, got %d", r.StatusCode)
 	}
 	p.Fingerprint = strings.Repeat("0", 64)
-	wrong := clientFor(p, token)
+	wrong, err := clientFor(p, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = request(wrong, token, "HEAD", "https://"+p.Address+"/v1/files/anything", nil)
 	if err == nil || !strings.Contains(err.Error(), "fingerprint mismatch") {
 		t.Fatalf("expected TLS pin failure, got %v", err)

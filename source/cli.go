@@ -69,10 +69,11 @@ func dispatchSend(args []string) error {
 	if len(pos) != 2 {
 		return errors.New("usage: xer send FILE DESTINATION --via https|sftp")
 	}
+	if via=="https" && activeSFTPPort!=0 {return errors.New("HTTPS requires HOST:PORT; --port is SFTP-only")}
 	if via == "https" {
 		return sendFileWithOptions(pos[0], pos[1], chunk, parallel)
 	}
-	if chunk != activeSettings.Chunk || parallel != activeSettings.Parallel {
+	if hasChunkOptions(filtered) {
 		return errors.New("chunk/parallel only supported by HTTPS")
 	}
 	return sftpSend(pos[0], pos[1], activeSFTPPort)
@@ -83,7 +84,7 @@ func dispatchGet(args []string) error {
 		return e
 	}
 	defer reset()
-	pos, via, chunk, parallel, e := transferArgs(filtered)
+	pos, via, _, _, e := transferArgs(filtered)
 	if e != nil {
 		return e
 	}
@@ -94,11 +95,14 @@ func dispatchGet(args []string) error {
 	if len(pos) == 2 {
 		dest = pos[1]
 	}
-	if chunk != activeSettings.Chunk || parallel != activeSettings.Parallel {
+	if hasChunkOptions(filtered) {
 		return errors.New("chunk/parallel only supported on HTTPS uploads")
 	}
+	if via=="https" && activeSFTPPort!=0 {return errors.New("HTTPS requires HOST:PORT; --port is SFTP-only")}
 	if via == "https" {
 		return getFile(pos[0], dest)
 	}
 	return sftpGet(pos[0], dest, activeSFTPPort)
 }
+
+func hasChunkOptions(args []string)bool{for _,arg:=range args{if arg=="--chunk" || arg=="--parallel"{return true}};return false}

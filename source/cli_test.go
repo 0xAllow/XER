@@ -37,3 +37,9 @@ func TestAutomationNeedsExplicitProtocol(t *testing.T) {
 		t.Fatal("missing via accepted")
 	}
 }
+
+func TestTransportSpecificFlagsAreNotSilentlyIgnored(t *testing.T){
+ if _,reset,e:=extractNetworkArgs([]string{"--proxy",""});e==nil{reset();t.Fatal("empty explicit proxy selected direct networking")}
+ if e:=dispatchSend([]string{"missing","127.0.0.1","--via","https","--port","2222"});e==nil || !strings.Contains(e.Error(),"HTTPS"){t.Fatal("HTTPS --port was silently ignored",e)}
+ if e:=dispatchGet([]string{"admin@127.0.0.1:file","--via","sftp","--parallel","1"});e==nil || !strings.Contains(e.Error(),"chunk/parallel"){t.Fatal("unsupported default-valued option was silently ignored",e)}
+}

@@ -12,7 +12,8 @@ func TestSignedRelease(t *testing.T) {
 	if err := os.WriteFile(artifact, []byte("sample release"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	priv, pub := filepath.Join(d, "key.pem"), filepath.Join(d, "key.pub")
+	keys := t.TempDir()
+	priv, pub := filepath.Join(keys, "key.pem"), filepath.Join(keys, "key.pub")
 	if err := run([]string{"keygen", "--private", priv, "--public", pub}); err != nil {
 		t.Fatal(err)
 	}
@@ -39,4 +40,17 @@ func TestManifestTraversal(t *testing.T) {
 	if err := verifyManifest(t.TempDir(), []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ../escape\n")); err == nil {
 		t.Fatal("path traversal accepted")
 	}
+}
+
+func TestManifestRefusesSigningPrivateKey(t *testing.T){
+ dir:=t.TempDir();priv,pub:=filepath.Join(dir,"key.pem"),filepath.Join(dir,"key.pub")
+ if err:=run([]string{"keygen","--private",priv,"--public",pub});err!=nil{t.Fatal(err)}
+ if err:=writeManifest(dir,filepath.Join(dir,"SHA256SUMS"));err==nil{t.Fatal("private signing key accepted in artifact directory")}
+}
+func TestKeygenNeverOverwrites(t *testing.T){
+ dir:=t.TempDir();priv,pub:=filepath.Join(dir,"key.pem"),filepath.Join(dir,"key.pub")
+ original:=[]byte("keep this file")
+ if err:=os.WriteFile(priv,original,0600);err!=nil{t.Fatal(err)}
+ if err:=run([]string{"keygen","--private",priv,"--public",pub});err==nil{t.Fatal("existing private path overwritten")}
+ actual,err:=os.ReadFile(priv);if err!=nil || string(actual)!=string(original){t.Fatal("private file changed",err)}
 }

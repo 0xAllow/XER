@@ -63,10 +63,10 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(*private, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER}), 0600); err != nil {
+		if err := writeNewKey(*private, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER}), 0600); err != nil {
 			return err
 		}
-		if err := os.WriteFile(*public, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}), 0644); err != nil {
+		if err := writeNewKey(*public, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}), 0644); err != nil {
 			return err
 		}
 		fmt.Println("Created signing keys. Keep the private key offline and outside release archives.")
@@ -193,6 +193,7 @@ func writeManifest(dir, path string) error {
 		if name == filepath.Base(path) || name == "SHA256SUMS.sig" || !entry.Type().IsRegular() {
 			continue
 		}
+		if err:=rejectPrivateMaterial(filepath.Join(dir,name));err!=nil{return err}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -251,4 +252,16 @@ func verifyManifest(dir string, data []byte) error {
 		return errors.New("empty checksum manifest")
 	}
 	return nil
+}
+
+func writeNewKey(path string,data []byte,mode os.FileMode) error {
+ f,err:=os.OpenFile(path,os.O_WRONLY|os.O_CREATE|os.O_EXCL,mode);if err!=nil{return err};defer f.Close()
+ if mode==0600{if err=secureKeyFile(path);err!=nil{return err}}
+ if _,err=f.Write(data);err!=nil{return err};if err=f.Sync();err!=nil{return err};return f.Close()
+}
+func rejectPrivateMaterial(path string)error{
+ f,err:=os.Open(path);if err!=nil{return err};defer f.Close()
+ b,err:=io.ReadAll(io.LimitReader(f,8192));if err!=nil{return err}
+ if strings.HasSuffix(strings.ToLower(path),".key") || strings.Contains(string(b),"-----BEGIN PRIVATE KEY-----") || strings.Contains(string(b),"-----BEGIN EC PRIVATE KEY-----") || strings.Contains(string(b),"-----BEGIN RSA PRIVATE KEY-----") || strings.Contains(string(b),"-----BEGIN OPENSSH PRIVATE KEY-----"){return errors.New("private signing material must not be in the artifact directory")}
+ return nil
 }
